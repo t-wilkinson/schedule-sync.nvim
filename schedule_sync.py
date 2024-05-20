@@ -104,82 +104,54 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
+month_pattern = re.compile(r"(\w+)\.")
+week_pattern = re.compile(r"^\s*(\d{2})\.")
+date_pattern = re.compile(r"^\s*([A-Za-z]{3}-\d{1,2})\.")
+time_pattern = re.compile(r"^\s*(\d{2}:\d{2})\s*(.+?)(?:\s*\[(\w+)\])?$")
+description_pattern = re.compile(r"^\s{4}(?!-)(.+)")
+task_pattern = re.compile(r"^\s*(-)\s*(.+)")
+task_pattern = re.compile(
+    r"^\s*(-)\s*(.+)", re.MULTILINE
+)  # Use MULTILINE to match across lines
+
+
 def parse_schedule(filename):
     with open(filename, "r") as file:
         content = file.read()
 
-    month_pattern = r"(\w+)\."
-    week_pattern = r"^\s*(\d{2})\."
-    date_pattern = r"^\s*([A-Za-z]{3}-\d{1,2})\."
-    time_pattern = r"^\s*(\d{2}:\d{2})\s*(.+?)(?:\s*\[(\w+)\])?$"  # 09:00 Lunch or 10:00 Meeting [Work]
-    task_pattern = r"^\s*(-)\s*(.+)"
     events = []
-    tasks = {}  # Use a dictionary for tasks, keyed by date
-
+    tasks = {}
     current_date = None
     current_year = datetime.date.today().year
     month_name = None
     prev_time_str = None
 
     for line in content.splitlines():
-        month_match = re.match(month_pattern, line)
+        month_match = month_pattern.match(line)
         if month_match:
             month_name = month_match.group(1)
             continue
         if not month_name:
             continue
 
-        week_match = re.match(week_pattern, line)
-        date_match = re.match(date_pattern, line)
+        week_match = week_pattern.match(line)
+        date_match = date_pattern.match(line)
         if date_match:
-            day_name, day_num = date_match.group(1).split("-")
+            day_name, day_num_str = date_match.group(1).split("-")
+            day_num = int(day_num_str)
             current_date = datetime.datetime.strptime(
                 f"{current_year}-{month_name}-{day_num}", "%Y-%B-%d"
             ).date()
             prev_time_str = None
 
-        time_match = re.match(time_pattern, line)
-        task_match = re.match(task_pattern, line)
+        time_match = time_pattern.match(line)
+        task_match = task_pattern.match(line)
 
         if time_match and current_date:
-            time_str, summary, calendar_name = time_match.groups()
-            calendar_id = CALENDAR_MAP.get(calendar_name, "primary")
-            start_time = datetime.datetime.combine(
-                current_date, datetime.datetime.strptime(time_str, "%H:%M").time()
+            event, prev_time_str = parse_time_block(
+                line, content, time_match, current_date, prev_time_str
             )
-
-            # Find the next time in the schedule
-            next_time_str = None
-            for next_line in content.splitlines()[
-                content.splitlines().index(line) + 1 :
-            ]:
-                next_time_match = re.match(time_pattern, next_line)
-                if next_time_match:
-                    next_time_str = next_time_match.group(1)
-                    break
-
-            # Calculate end_time based on the next event's time or default to 1 hour
-            if next_time_str:
-                end_time = datetime.datetime.combine(
-                    current_date,
-                    datetime.datetime.strptime(next_time_str, "%H:%M").time(),
-                )
-            else:
-                end_time = start_time + timedelta(hours=1)
-
-            event = {
-                "summary": summary,
-                "start": {
-                    "dateTime": start_time.isoformat(),
-                    "timeZone": TIMEZONE,
-                },
-                "end": {
-                    "dateTime": end_time.isoformat(),
-                    "timeZone": TIMEZONE,
-                },
-            }
-            events.append((event, calendar_id))
-            prev_time_str = time_str
+            events.append(event)
 
         elif task_match and current_date:
             task = task_match.group(2)
@@ -188,11 +160,82 @@ def parse_schedule(filename):
     return events, tasks
 
 
+def parse_time_block(line, content, time_match, current_date, prev_time_str):
+    """Parses a time block, including summary, calendar, description, and tasks."""
+
+    time_str, summary, calendar_name = time_match.groups()
+    calendar_id = CALENDAR_MAP.get(calendar_name, "primary")
+    start_time = datetime.datetime.combine(
+        current_date, datetime.datetime.strptime(time_str, "%H:%M").time()
+    )
+
+    # Find the next time in the schedule to calculate end_time
+    next_time_str = None
+    for next_line in content.splitlines()[content.splitlines().index(line) + 1 :]:
+        next_time_match = time_pattern.match(next_line)
+        if next_time_match:
+            next_time_str = next_time_match.group(1)
+            break
+
+    if next_time_str:
+        end_time = datetime.datetime.combine(
+            current_date,
+            datetime.datetime.strptime(next_time_str, "%H:%M").time(),
+        )
+    else:
+        end_time = start_time + timedelta(hours=1)
+
+    # Extract description, location, and tasks
+    description, location, event_tasks = parse_event_details(content, line)
+
+    # Create event
+    event = {
+        "summary": summary,
+        "description": "\n".join(description),
+        "start": {"dateTime": start_time.isoformat(), "timeZone": TIMEZONE},
+        "end": {"dateTime": end_time.isoformat(), "timeZone": TIMEZONE},
+    }
+    if location:
+        event["location"] = location
+
+    return (event, calendar_id), prev_time_str
+
+
+def parse_event_details(content, current_line):
+    """Parses event details (description, location, tasks) from lines following the time block."""
+
+    description = []
+    location = None
+    tasks = []
+
+    for next_line in content.splitlines()[
+        content.splitlines().index(current_line) + 1 :
+    ]:
+        next_time_match = time_pattern.match(next_line)
+        if next_time_match:
+            break
+        elif next_line.strip().startswith("Location:"):
+            location = next_line.strip()[len("Location:") :].strip()
+        elif next_line.strip().startswith("Tasks:"):
+            continue
+        elif next_line.strip().startswith("-"):
+            task = next_line.strip()[len("-") :].strip()
+            tasks.append(task)
+        elif description_match := description_pattern.match(next_line):
+            description.append(description_match.group(1))
+        elif not next_line.strip():
+            continue
+        else:
+            break
+
+    return description, location, tasks
+
+
 def sync_from_google(filename):
     service = get_calendar_service()
 
     # Fetch events from all calendars in the CALENDAR_MAP
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(timezone.utc)
     time_min = now - timedelta(days=7)
     time_max = now + timedelta(days=365)
 
@@ -211,11 +254,11 @@ def sync_from_google(filename):
         )
         all_events.extend(events_result.get("items", []))
 
-    # Fetch tasks (all-day events) from the TASK_CALENDAR_ID
+    # Fetch tasks (all-day events) from the task calendar id
     tasks_result = (
         service.events()
         .list(
-            calendarId=TASK_CALENDAR_ID,
+            calendarId=CALENDAR_MAP["tasks"],
             timeMin=time_min.isoformat(),
             timeMax=time_max.isoformat(),
             singleEvents=True,
@@ -268,10 +311,14 @@ def sync_to_google(events, tasks):
             if to_modify:
                 event_to_modify = to_modify[0]
                 event_to_modify.update(event)
-                # service.events().update(calendarId=calendar_id, eventId=event_to_modify['id'], body=event_to_modify).execute()
+                service.events().update(
+                    calendarId=calendar_id,
+                    eventId=event_to_modify["id"],
+                    body=event_to_modify,
+                ).execute()
                 print(f"Event modified: {event['summary']}")
             else:
-                # service.events().insert(calendarId=calendar_id, body=event).execute()
+                service.events().insert(calendarId=calendar_id, body=event).execute()
                 print(f"Event created: {event['summary']}")
 
     # Delete missing events
@@ -286,7 +333,9 @@ def sync_to_google(events, tasks):
                 "start": {"date": date.isoformat()},
                 "end": {"date": (date + timedelta(days=1)).isoformat()},
             }
-            # service.events().insert(calendarId=CALENDAR_MAPS["tasks"], body=event).execute()
+            service.events().insert(
+                calendarId=CALENDAR_MAP["tasks"], body=event
+            ).execute()
             print(f"Task created: {task} on {date}")
 
 
